@@ -5,13 +5,18 @@ from ayon_core.pipeline.workfile.lock_workfile import get_workfile_lock_data
 
 
 class WorkfileLockDialog(QtWidgets.QDialog):
-    def __init__(self, workfile_path, parent=None):
+    def __init__(self, workfile_path, parent=None, lock_data=None):
         super(WorkfileLockDialog, self).__init__(parent)
         self.setWindowTitle("Warning")
         icon = QtGui.QIcon(get_app_icon_path())
         self.setWindowIcon(icon)
 
-        data = get_workfile_lock_data(workfile_path)
+        # Callers that already read the sidecar can pass it in. These live
+        #   next to the workfile on a network share, so re-reading it just
+        #   to fill in a label is a round-trip for nothing.
+        data = lock_data
+        if data is None:
+            data = get_workfile_lock_data(workfile_path)
 
         message = "{} on {} machine is working on the same workfile.".format(
             data["username"],

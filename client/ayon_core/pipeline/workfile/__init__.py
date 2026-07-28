@@ -8,6 +8,7 @@ from .path_resolving import (
     get_last_workfile_from_paths,
     get_last_workfile_with_version,
     get_last_workfile,
+    resolve_launch_workfile_path,
 
     get_custom_workfile_template,
     get_custom_workfile_template_by_string_context,
@@ -34,6 +35,7 @@ from .lock_workfile import (
     is_workfile_locked,
     is_workfile_locked_for_current_process,
     is_workfile_lock_enabled,
+    is_stale_lock_data,
     get_workfile_lock_data,
     create_workfile_lock,
     remove_workfile_lock,
@@ -41,8 +43,10 @@ from .lock_workfile import (
 )
 
 from .workfile_lock_mixin import (
+    AYON_WORKFILE_LOCK_OVERRIDE,
     WorkfileLockMixin,
     WorkfileLockedError,
+    confirm_locked_workfile,
 )
 
 from .build_workfile import BuildWorkfile
@@ -67,6 +71,7 @@ __all__ = (
     "get_last_workfile_from_paths",
     "get_last_workfile_with_version",
     "get_last_workfile",
+    "resolve_launch_workfile_path",
     "find_workfile_rootless_path",
 
     "get_custom_workfile_template",
@@ -89,13 +94,16 @@ __all__ = (
     "is_workfile_locked",
     "is_workfile_locked_for_current_process",
     "is_workfile_lock_enabled",
+    "is_stale_lock_data",
     "get_workfile_lock_data",
     "create_workfile_lock",
     "remove_workfile_lock",
     "delete_workfile_lock",
 
+    "AYON_WORKFILE_LOCK_OVERRIDE",
     "WorkfileLockMixin",
     "WorkfileLockedError",
+    "confirm_locked_workfile",
 
     "BuildWorkfile",
 

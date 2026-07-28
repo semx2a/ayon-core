@@ -1,5 +1,6 @@
 import os
 import json
+import socket
 from ayon_core.lib import Logger, filter_profiles
 from ayon_core.lib.ayon_info import get_workstation_info
 from ayon_core.settings import get_project_settings
@@ -65,8 +66,66 @@ def create_workfile_lock(filepath):
     lock_filepath = _get_lock_file(filepath)
     info = get_workstation_info()
     info["process_id"] = _get_process_id()
+    # 'process_id' is a uuid, so it cannot tell whether the session that
+    #   wrote the lock is still alive. The operating system pid can, but
+    #   only on the machine that wrote it, so both are stored.
+    info["system_pid"] = os.getpid()
     with open(lock_filepath, "w") as stream:
         json.dump(info, stream)
+
+
+def _is_pid_running(pid):
+    """Whether a process id is alive on this machine.
+
+    Args:
+        pid (int): Operating system process id.
+
+    Returns:
+        bool: Process is running. ``True`` when there is no way to tell,
+            so an unknown state never clears somebody's lock.
+
+    """
+    try:
+        import psutil
+    except ImportError:
+        return True
+
+    try:
+        return psutil.pid_exists(pid)
+    except Exception:
+        return True
+
+
+def is_stale_lock_data(lock_data):
+    """Whether lock data was left behind by a dead session.
+
+    Only answerable for locks written on this workstation, because a pid
+    from another machine means nothing here. Anything uncertain counts as
+    not stale, so a live session never has its lock cleared underneath it.
+
+    Args:
+        lock_data (dict[str, Any]): Content of a lock file.
+
+    Returns:
+        bool: The session holding the lock is gone.
+
+    """
+    if not isinstance(lock_data, dict):
+        return False
+
+    if lock_data.get("hostname") != socket.gethostname():
+        return False
+
+    system_pid = lock_data.get("system_pid")
+    # Locks written before 'system_pid' was stored, and anything that is
+    #   not a plain pid, stay untouched.
+    if not isinstance(system_pid, int):
+        return False
+
+    if system_pid == os.getpid():
+        return False
+
+    return not _is_pid_running(system_pid)
 
 
 def remove_workfile_lock(filepath):

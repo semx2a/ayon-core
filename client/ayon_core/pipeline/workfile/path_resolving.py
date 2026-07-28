@@ -547,6 +547,40 @@ def get_last_workfile_with_version(
     )
 
 
+def resolve_launch_workfile_path(
+    data: dict[str, Any]
+) -> Optional[str]:
+    """Resolve the workfile an application will be launched with.
+
+    Shared by the prelaunch hooks that act on that workfile:
+    ``AddLastWorkfileToLaunchArgs`` turns it into a launch argument and
+    ``CheckWorkfileLock`` refuses it when somebody else has it open. They
+    have to agree on which workfile is meant, so the resolution lives in
+    one place.
+
+    ``workfile_path`` and ``start_last_workfile`` are the entire input
+    contract, so a hook that wants to keep an application from opening a
+    workfile clears both.
+
+    Args:
+        data (dict[str, Any]): Launch context data.
+
+    Returns:
+        Optional[str]: Path to an existing workfile, or ``None`` when the
+            application is launched without one.
+
+    """
+    workfile_path = data.get("workfile_path")
+    if not workfile_path:
+        if not data.get("start_last_workfile"):
+            return None
+        workfile_path = data.get("last_workfile_path")
+
+    if not workfile_path or not os.path.exists(workfile_path):
+        return None
+    return workfile_path
+
+
 def get_last_workfile(
     workdir: str,
     file_template: str,

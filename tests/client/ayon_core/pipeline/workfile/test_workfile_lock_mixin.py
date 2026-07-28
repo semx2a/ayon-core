@@ -7,15 +7,17 @@ do as well.
 """
 import json
 import os
+import socket
 
 import pytest
 
-from ayon_core.pipeline.workfile import workfile_lock_mixin
+from ayon_core.pipeline.workfile import lock_workfile, workfile_lock_mixin
 from ayon_core.pipeline.workfile.lock_workfile import (
     _get_lock_file,
     create_workfile_lock,
 )
 from ayon_core.pipeline.workfile.workfile_lock_mixin import (
+    AYON_WORKFILE_LOCK_OVERRIDE,
     WorkfileLockedError,
     WorkfileLockMixin,
 )
@@ -60,11 +62,11 @@ class _SaveContext:
 
 
 class _InterfaceStub:
-    """Stands in for 'IWorkfileHost' - the hooks the mixin calls super() on.
+    """Stands in for the 'IWorkfileHost' hooks the mixin calls super() on.
 
-    Records the calls so the tests can prove cooperative dispatch, which
-    matters because 'IWorkfileHost._after_workfile_save' has a real
-    implementation, not a 'pass'.
+    Records the calls so the tests can check that the mixin passes them
+    on with 'super()', which matters because
+    'IWorkfileHost._after_workfile_save' does real work, not a 'pass'.
     """
 
     def __init__(self):
@@ -85,6 +87,10 @@ class FakeHost(WorkfileLockMixin, _InterfaceStub):
 
     name = "testhost"
 
+    # Stands for the exit signal a real host wires. Without it the mixin
+    #   never acquires anything.
+    workfile_lock_release_wired = True
+
     def __init__(self, gui_available=True, confirm=True):
         super().__init__()
         self._gui_available = gui_available
@@ -102,7 +108,7 @@ class FakeHost(WorkfileLockMixin, _InterfaceStub):
     def _is_interactive_session(self):
         return self._gui_available
 
-    def confirm_locked_workfile(self, filepath):
+    def confirm_locked_workfile(self, filepath, lock_data=None):
         self.confirm_calls.append(filepath)
         return self._confirm
 
@@ -137,6 +143,9 @@ def lock_warnings(monkeypatch):
     class _RecordingLog:
         def warning(self, message, *args, **kwargs):
             messages.append(message % args if args else message)
+
+        def info(self, message, *args, **kwargs):
+            pass
 
         def debug(self, message, *args, **kwargs):
             pass
@@ -200,6 +209,20 @@ class TestAcquireRelease:
 
         assert os.path.exists(_lock_path(workfile))
 
+    def test_acquire_skipped_without_release_wiring(self, workfile):
+        """A host that never releases must never acquire either."""
+        class _UnwiredHost(FakeHost):
+            workfile_lock_release_wired = False
+
+        host = _UnwiredHost()
+
+        host.acquire_workfile_lock(
+            workfile, project_settings=_project_settings()
+        )
+
+        assert not os.path.exists(_lock_path(workfile))
+        assert host._locked_workfile_path is None
+
     def test_acquire_without_filepath(self):
         host = FakeHost()
         host.acquire_workfile_lock(
@@ -243,6 +266,46 @@ class TestLockHolder:
 
         assert holder is None
 
+    def test_stale_local_lock_is_cleared(self, workfile, monkeypatch):
+        """A lock from a dead session here is not treated as a holder.
+
+        Nothing else could ever remove it, because 'remove_workfile_lock'
+        only removes locks whose uuid matches the current process.
+        """
+        monkeypatch.setattr(lock_workfile, "_is_pid_running", lambda _: False)
+        with open(_lock_path(workfile), "w") as stream:
+            json.dump(
+                {
+                    "username": "me",
+                    "hostname": socket.gethostname(),
+                    "process_id": "a-dead-session",
+                    "system_pid": 999999,
+                },
+                stream,
+            )
+        host = FakeHost()
+
+        holder = host.get_workfile_lock_holder(
+            workfile, project_settings=_project_settings()
+        )
+
+        assert holder is None
+        assert not os.path.exists(_lock_path(workfile))
+
+    def test_stale_check_ignores_other_machines(self, workfile, monkeypatch):
+        """A pid is only meaningful on the machine that recorded it."""
+        monkeypatch.setattr(lock_workfile, "_is_pid_running", lambda _: False)
+        with open(_lock_path(workfile), "w") as stream:
+            json.dump(dict(FOREIGN_LOCK, system_pid=999999), stream)
+        host = FakeHost()
+
+        holder = host.get_workfile_lock_holder(
+            workfile, project_settings=_project_settings()
+        )
+
+        assert holder is not None
+        assert os.path.exists(_lock_path(workfile))
+
     def test_unlocked_workfile(self, workfile):
         host = FakeHost()
 
@@ -260,7 +323,7 @@ class TestLockHolder:
     def test_malformed_lock_treated_as_unlocked(
         self, workfile, lock_content
     ):
-        """A broken sidecar must not raise or block the artist."""
+        """A broken lock file must not raise or block the artist."""
         host = FakeHost()
         with open(_lock_path(workfile), "w") as stream:
             stream.write(lock_content)
@@ -270,6 +333,112 @@ class TestLockHolder:
         )
 
         assert holder is None
+
+
+@pytest.mark.unit
+class TestExternalWorkfileOpen:
+    """The launcher path, where the workfile is already open."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_override(self, monkeypatch):
+        monkeypatch.delenv(AYON_WORKFILE_LOCK_OVERRIDE, raising=False)
+
+    def test_unlocked_acquires(self, workfile):
+        host = FakeHost()
+
+        held = host.handle_external_workfile_open(
+            workfile, project_settings=_project_settings()
+        )
+
+        assert held is True
+        assert host.confirm_calls == []
+        assert os.path.exists(_lock_path(workfile))
+
+    def test_foreign_lock_confirmed_takes_over(self, workfile):
+        _write_foreign_lock(workfile)
+        host = FakeHost(confirm=True)
+
+        held = host.handle_external_workfile_open(
+            workfile, project_settings=_project_settings()
+        )
+
+        assert held is True
+        assert host.confirm_calls == [workfile]
+        assert host._locked_workfile_path == workfile
+
+    def test_foreign_lock_declined_leaves_it(self, workfile):
+        _write_foreign_lock(workfile)
+        host = FakeHost(confirm=False)
+
+        held = host.handle_external_workfile_open(
+            workfile, project_settings=_project_settings()
+        )
+
+        assert held is False
+        with open(_lock_path(workfile)) as stream:
+            assert json.load(stream) == FOREIGN_LOCK
+
+    def test_override_for_this_path_skips_the_dialog(
+        self, workfile, monkeypatch
+    ):
+        """The artist already answered in the prelaunch hook."""
+        _write_foreign_lock(workfile)
+        monkeypatch.setenv(AYON_WORKFILE_LOCK_OVERRIDE, workfile)
+        host = FakeHost(confirm=False)
+
+        held = host.handle_external_workfile_open(
+            workfile, project_settings=_project_settings()
+        )
+
+        assert held is True
+        assert host.confirm_calls == []
+
+    def test_override_for_another_path_still_asks(
+        self, workdir, workfile, monkeypatch
+    ):
+        _write_foreign_lock(workfile)
+        monkeypatch.setenv(
+            AYON_WORKFILE_LOCK_OVERRIDE, str(workdir / "other.test")
+        )
+        host = FakeHost(confirm=False)
+
+        host.handle_external_workfile_open(
+            workfile, project_settings=_project_settings()
+        )
+
+        assert host.confirm_calls == [workfile]
+
+    @pytest.mark.parametrize(
+        "enabled", [True, False], ids=["enabled", "disabled"]
+    )
+    def test_override_is_always_popped(self, workfile, monkeypatch, enabled):
+        """An unused answer must not apply to a later workfile."""
+        monkeypatch.setenv(AYON_WORKFILE_LOCK_OVERRIDE, workfile)
+        host = FakeHost()
+
+        host.handle_external_workfile_open(
+            workfile, project_settings=_project_settings(enabled=enabled)
+        )
+
+        assert AYON_WORKFILE_LOCK_OVERRIDE not in os.environ
+
+    def test_disabled_does_nothing(self, workfile):
+        _write_foreign_lock(workfile)
+        host = FakeHost()
+
+        held = host.handle_external_workfile_open(
+            workfile, project_settings=_project_settings(enabled=False)
+        )
+
+        assert held is False
+        assert host.confirm_calls == []
+        with open(_lock_path(workfile)) as stream:
+            assert json.load(stream) == FOREIGN_LOCK
+
+    def test_no_filepath(self):
+        host = FakeHost()
+
+        assert host.handle_external_workfile_open(None) is False
 
 
 @pytest.mark.unit
@@ -435,6 +604,49 @@ class TestSaveHook:
 
         assert host.super_calls == ["after_save"]
 
+    def test_save_as_onto_foreign_lock_asks(self, workdir, workfile):
+        """Version-up can land on a workfile somebody else is in."""
+        host = FakeHost(confirm=True)
+        settings = _project_settings()
+        host.acquire_workfile_lock(workfile, project_settings=settings)
+
+        new_path = str(workdir / "scene_v002.test")
+        _write_foreign_lock(new_path)
+
+        host._after_workfile_save(_SaveContext(new_path, settings))
+
+        assert host.confirm_calls == [new_path]
+        assert host._locked_workfile_path == new_path
+
+    def test_save_as_onto_foreign_lock_refused(self, workdir, workfile):
+        """Declining leaves the other session's lock untouched."""
+        host = FakeHost(confirm=False)
+        settings = _project_settings()
+        host.acquire_workfile_lock(workfile, project_settings=settings)
+
+        new_path = str(workdir / "scene_v002.test")
+        _write_foreign_lock(new_path)
+
+        host._after_workfile_save(_SaveContext(new_path, settings))
+
+        assert host.confirm_calls == [new_path]
+        with open(_lock_path(new_path)) as stream:
+            assert json.load(stream) == FOREIGN_LOCK
+        assert host._locked_workfile_path is None
+
+    def test_headless_save_keeps_the_lock(self, workdir, workfile):
+        """The old lock is not dropped by a session that cannot re-take it."""
+        host = FakeHost()
+        settings = _project_settings()
+        host.acquire_workfile_lock(workfile, project_settings=settings)
+
+        host._gui_available = False
+        new_path = str(workdir / "scene_v002.test")
+        host._after_workfile_save(_SaveContext(new_path, settings))
+
+        assert os.path.exists(_lock_path(workfile))
+        assert host._locked_workfile_path == workfile
+
 
 @pytest.mark.unit
 class TestBaseClassOrderWarning:
@@ -460,7 +672,7 @@ class TestBaseClassOrderWarning:
         assert lock_warnings == []
 
     def test_no_warning_for_host_own_override(self, lock_warnings):
-        """A host overriding a hook itself is legitimate."""
+        """A host is allowed to override a hook itself."""
 
         class OverridingHost(WorkfileLockMixin, _InterfaceStub):
             name = "testhost"

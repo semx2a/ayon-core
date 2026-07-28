@@ -10,11 +10,14 @@ If locking were automatic for every host, hosts without release wiring
 would start leaving stale ``.oplock`` files behind. So it is opt-in: a
 host adds :class:`WorkfileLockMixin` to its bases and completes the
 feature with a single :meth:`WorkfileLockMixin.release_workfile_lock`
-call from its own exit signal.
+call from its own exit signal, then sets
+``workfile_lock_release_wired`` to say so. Without that attribute the
+mixin stays inert, so a half-finished adoption cannot strand locks.
 
 """
 from __future__ import annotations
 
+import os
 import typing
 from typing import Any, Optional
 
@@ -22,13 +25,14 @@ from ayon_core.lib import Logger
 
 from .lock_workfile import (
     create_workfile_lock,
+    delete_workfile_lock,
     get_workfile_lock_data,
+    is_stale_lock_data,
+    is_workfile_lock_enabled,
     is_workfile_locked,
     remove_workfile_lock,
     # Wraps an import that cannot happen at module level, see its docstring.
     _get_process_id,
-    # Aliased because the mixin exposes a method with the same name.
-    is_workfile_lock_enabled as _host_lock_enabled,
 )
 
 if typing.TYPE_CHECKING:
@@ -41,15 +45,19 @@ if typing.TYPE_CHECKING:
         SaveWorkfileContext,
     )
 
-    # Gives type checkers the host methods the mixin relies on ('name',
-    #   'get_current_project_name') and the hooks it calls 'super()' on.
-    #   At runtime the base is 'object', so the mixin adds nothing to the
-    #   method resolution order of the host that adopts it.
+    # Lets type checkers see the host methods the mixin uses. At runtime
+    #   the base is 'object', so the mixin adds nothing to the method
+    #   resolution order of the host that adopts it.
     _MixinBase = IWorkfileHost
 else:
     _MixinBase = object
 
 log = Logger.get_logger("WorkfileLockMixin")
+
+# Set by 'CheckWorkfileLock' when the artist chose to ignore a lock, read
+#   once inside the session by 'handle_external_workfile_open'. A launch
+#   hook has no other way to talk to the session it starts.
+AYON_WORKFILE_LOCK_OVERRIDE = "AYON_WORKFILE_LOCK_OVERRIDE"
 
 # Interface hooks implemented by the mixin. Used to warn about a base class
 #   order that would shadow them.
@@ -58,6 +66,36 @@ _HOOK_METHOD_NAMES = (
     "_after_workfile_open",
     "_after_workfile_save",
 )
+
+
+def confirm_locked_workfile(
+    filepath: str, lock_data: Optional[dict[str, Any]] = None
+) -> bool:
+    """Ask the artist whether to open a workfile locked by someone.
+
+    Shared by :meth:`WorkfileLockMixin.confirm_locked_workfile` and by
+    launch hooks, which run before a host instance exists and would
+    otherwise have to reimplement the dialog.
+
+    Args:
+        filepath (str): Path to the locked workfile.
+        lock_data (Optional[dict[str, Any]]): Already read content of the
+            lock file. Read by the dialog when not passed.
+
+    Returns:
+        bool: Continue with opening the workfile.
+
+    Raises:
+        Exception: The dialog could not be shown. Callers decide what to
+            do when the artist cannot be asked.
+
+    """
+    # Imported here to keep Qt out of the 'ayon_core.pipeline' import
+    #   graph, which is imported in contexts without a GUI.
+    from ayon_core.tools.workfiles.lock_dialog import WorkfileLockDialog
+
+    dialog = WorkfileLockDialog(filepath, lock_data=lock_data)
+    return bool(dialog.exec_())
 
 
 class WorkfileLockedError(RuntimeError):
@@ -93,7 +131,7 @@ class WorkfileLockMixin(_MixinBase):
         class MyHost(HostBase, WorkfileLockMixin, IWorkfileHost):
             ...
 
-    The mixin covers what is generic:
+    The mixin covers the parts that are the same for every host:
 
     * refusing to open a workfile locked by someone else, after asking
       the artist (``_before_workfile_open``),
@@ -103,46 +141,67 @@ class WorkfileLockMixin(_MixinBase):
       (``_after_workfile_save``).
 
     The adopting host **must** call :meth:`release_workfile_lock` from
-    whatever exit signal it has. Core has no host teardown hook, so a host
-    that adopts the mixin without wiring release will leave stale
-    ``.oplock`` files behind.
+    whatever exit signal it has, and set ``workfile_lock_release_wired``
+    to declare that it did. Core has no host teardown hook and cannot
+    check this itself, so until the attribute is set no lock is acquired
+    at all. A lock nobody releases would make workfiles look permanently
+    taken.
 
     A host overriding any of the hooks above has to call ``super()`` or
     locking silently stops working.
 
     Notes:
-        Locking is advisory. The dialog offers an "Ignore lock" button and
-            an artist who ignores a lock takes it over, because they do
-            have the workfile open at that point.
+        Locking is advisory. The dialog has an "Ignore lock" button, and
+            an artist who chooses it takes the lock over.
 
         Every method is a no-op when locking is disabled by project
             settings or when no filepath is known, so callers do not need
-            their own guards. No filesystem failure is ever raised to the
-            caller either - failing to lock must not stop an artist from
-            opening or saving a workfile.
+            their own guards. No filesystem failure is ever raised to
+            the caller either, because failing to lock must not stop an
+            artist from opening or saving a workfile.
 
     """
+    # Set to True by a host that calls 'release_workfile_lock' from its own
+    #   exit signal. Until it does, no lock is ever acquired: a lock nobody
+    #   releases is worse than no lock at all.
+    workfile_lock_release_wired: bool = False
+
+    # Is an artist sitting in front of this session? Left as None, the
+    #   guess in '_is_interactive_session' decides. Hosts that run Qt
+    #   headlessly have to answer this themselves.
+    workfile_lock_interactive: Optional[bool] = None
+
     # Path of the workfile locked by this session. Declared on the class so
-    #   the mixin needs no '__init__' - hosts do not cooperatively call
+    #   the mixin needs no '__init__'. Hosts do not cooperatively call
     #   'super().__init__()'.
     _locked_workfile_path: Optional[str] = None
 
+    # Set when the lock dialog could not be shown. The open continues, but
+    #   the lock is left with its owner, since nobody answered.
+    _lock_dialog_failed: bool = False
+
     def __init_subclass__(cls, **kwargs):
-        """Warn when base class order shadows the locking hooks."""
+        """Warn about adoption mistakes that silently break locking."""
         super().__init_subclass__(**kwargs)
         try:
             _warn_on_shadowed_hooks(cls)
+            _warn_on_missing_release(cls)
         except Exception:
             # A diagnostic must never break class creation.
             pass
 
     # --- Public API ---
-    def is_workfile_lock_enabled(
+    def is_workfile_locking_enabled(
         self,
         project_name: Optional[str] = None,
         project_settings: Optional[dict[str, Any]] = None,
     ) -> bool:
         """Whether workfile locking is enabled for this host and project.
+
+        Named differently from the module level
+        ``is_workfile_lock_enabled(host_name, project_name, settings)`` on
+        purpose. The same name with a different first argument invites
+        passing a host name where a project name is expected.
 
         Args:
             project_name (Optional[str]): Project name. Current project of
@@ -160,7 +219,7 @@ class WorkfileLockMixin(_MixinBase):
             if not project_name:
                 return False
             return bool(
-                _host_lock_enabled(
+                is_workfile_lock_enabled(
                     self.name, project_name, project_settings
                 )
             )
@@ -183,7 +242,8 @@ class WorkfileLockMixin(_MixinBase):
 
         A lock owned by the current process is not a foreign lock, so
         ``None`` is returned for it. An unreadable or corrupted lock file
-        counts as unlocked - a broken sidecar must not block an artist.
+        counts as unlocked, because a broken one must not keep an artist
+        out of their workfile.
 
         Args:
             filepath (Optional[str]): Path to the workfile.
@@ -200,16 +260,15 @@ class WorkfileLockMixin(_MixinBase):
         if not filepath:
             return None
 
-        if not self.is_workfile_lock_enabled(
+        if not self.is_workfile_locking_enabled(
             project_name, project_settings
         ):
             return None
 
         try:
-            # Cheap early out for the common case, then a single read.
-            #   Chaining 'is_workfile_locked_for_current_process' and
-            #   'get_workfile_lock_data' would parse the sidecar twice,
-            #   and these live next to the workfile on a network share.
+            # One existence check, then one read. Going through
+            #   'is_workfile_locked_for_current_process' would read the
+            #   lock file twice, and it usually sits on a network share.
             if not is_workfile_locked(filepath):
                 return None
             lock_data = get_workfile_lock_data(filepath)
@@ -217,6 +276,17 @@ class WorkfileLockMixin(_MixinBase):
             #   written by us and is malformed, which the 'except' below
             #   turns into "unlocked" rather than a lock nobody can clear.
             if lock_data["process_id"] == _get_process_id():
+                return None
+            if is_stale_lock_data(lock_data):
+                # Our machine, and the session that wrote it is gone.
+                #   Nothing else can clear it, since 'remove_workfile_lock'
+                #   only removes locks whose uuid matches this process.
+                log.info(
+                    "Clearing the workfile lock of '%s' left behind by a"
+                    " session that is no longer running.",
+                    filepath,
+                )
+                delete_workfile_lock(filepath)
                 return None
             return lock_data
         except Exception:
@@ -237,8 +307,8 @@ class WorkfileLockMixin(_MixinBase):
     ) -> None:
         """Lock the workfile for the current session.
 
-        Overwrites an existing lock. Opening a workfile that someone else
-        has locked is a decision made before this is called.
+        Overwrites an existing lock. Whether to take over somebody
+        else's lock is decided before this is called.
 
         Args:
             filepath (Optional[str]): Path to the workfile to lock.
@@ -251,7 +321,11 @@ class WorkfileLockMixin(_MixinBase):
         if not filepath:
             return
 
-        if not self.is_workfile_lock_enabled(
+        if not self.workfile_lock_release_wired:
+            # Nothing would ever remove this lock. See the class attribute.
+            return
+
+        if not self.is_workfile_locking_enabled(
             project_name, project_settings
         ):
             return
@@ -268,14 +342,95 @@ class WorkfileLockMixin(_MixinBase):
 
         self._locked_workfile_path = filepath
 
+    def handle_external_workfile_open(
+        self,
+        filepath: Optional[str],
+        *,
+        project_name: Optional[str] = None,
+        project_settings: Optional[dict[str, Any]] = None,
+    ) -> bool:
+        """Lock a workfile the host opened outside of core.
+
+        ``open_workfile_with_context`` is not the only way a workfile
+        ends up open. Hosts that get one as a launch argument open it
+        natively, and Maya's File > Open opens one without going through
+        core at all. Those paths never reach
+        :meth:`_after_workfile_open`, so they call this instead.
+
+        The workfile is already open by the time this runs, so it is too
+        late to refuse. A lock taken by somebody else between the
+        prelaunch check and now can only be reported, and it stays with
+        its owner unless the artist takes it over.
+
+        Args:
+            filepath (Optional[str]): Path to the opened workfile.
+            project_name (Optional[str]): Project name. Current project of
+                the host is used when not passed.
+            project_settings (Optional[dict[str, Any]]): Prepared project
+                settings. Queried when not passed.
+
+        Returns:
+            bool: The lock is held by this session.
+
+        """
+        try:
+            # Popped whether or not it is used, so an answer about one
+            #   workfile can never apply to a later one in the same
+            #   session.
+            override_path = os.environ.pop(AYON_WORKFILE_LOCK_OVERRIDE, "")
+
+            if not filepath:
+                return False
+
+            if not self.is_workfile_locking_enabled(
+                project_name, project_settings
+            ):
+                return False
+
+            answered = bool(override_path) and (
+                os.path.normpath(override_path)
+                == os.path.normpath(filepath)
+            )
+            if not answered:
+                lock_data = self.get_workfile_lock_holder(
+                    filepath,
+                    project_name=project_name,
+                    project_settings=project_settings,
+                )
+                if lock_data is not None and not self.confirm_locked_workfile(
+                    filepath, lock_data
+                ):
+                    log.warning(
+                        "Workfile '%s' stays locked by %s on %s.",
+                        filepath,
+                        lock_data.get("username"),
+                        lock_data.get("hostname"),
+                    )
+                    return False
+
+            self.acquire_workfile_lock(
+                filepath,
+                project_name=project_name,
+                project_settings=project_settings,
+            )
+        except Exception:
+            log.warning(
+                "Failed to lock the opened workfile '%s'.",
+                filepath,
+                exc_info=True,
+            )
+            return False
+
+        return self._locked_workfile_path == filepath
+
     def release_workfile_lock(
         self, filepath: Optional[str] = None
     ) -> None:
         """Release a workfile lock held by the current session.
 
-        Idempotent and safe to call when no lock is held, so it can be
-        wired to an exit signal that may fire more than once. A lock owned
-        by a different process is left alone.
+        Safe to call more than once, and safe when no lock is held, so
+        it can be wired to an exit signal that may fire twice. A lock
+        owned by a different process is left alone.
 
         Args:
             filepath (Optional[str]): Path to the workfile to unlock. The
@@ -300,7 +455,9 @@ class WorkfileLockMixin(_MixinBase):
             if filepath == self._locked_workfile_path:
                 self._locked_workfile_path = None
 
-    def confirm_locked_workfile(self, filepath: str) -> bool:
+    def confirm_locked_workfile(
+        self, filepath: str, lock_data: Optional[dict[str, Any]] = None
+    ) -> bool:
         """Ask the artist whether to open a workfile locked by someone.
 
         Can be overridden to change how the artist is asked, e.g. to
@@ -308,24 +465,24 @@ class WorkfileLockMixin(_MixinBase):
 
         Args:
             filepath (str): Path to the locked workfile.
+            lock_data (Optional[dict[str, Any]]): Already read content of
+                the lock file.
 
         Returns:
             bool: Continue with opening the workfile.
 
         """
-        # Imported here to keep Qt out of the 'ayon_core.pipeline' import
-        #   graph - 'pipeline' is imported in contexts without a GUI.
         try:
-            from ayon_core.tools.workfiles.lock_dialog import (
-                WorkfileLockDialog,
-            )
-
-            dialog = WorkfileLockDialog(filepath)
-            return bool(dialog.exec_())
+            return confirm_locked_workfile(filepath, lock_data)
         except Exception:
+            # Fail open, so a broken dialog cannot keep an artist out of
+            #   a workfile. The lock stays with its owner though, since
+            #   nobody answered the question.
+            self._lock_dialog_failed = True
             log.warning(
                 "Failed to show the workfile lock dialog for '%s'."
-                " Continuing with the workfile open.",
+                " Continuing with the workfile open, without taking the"
+                " lock.",
                 filepath,
                 exc_info=True,
             )
@@ -337,6 +494,7 @@ class WorkfileLockMixin(_MixinBase):
     ) -> None:
         super()._before_workfile_open(open_workfile_context)
 
+        self._lock_dialog_failed = False
         filepath = open_workfile_context.filepath
         lock_data = self.get_workfile_lock_holder(
             filepath,
@@ -347,11 +505,9 @@ class WorkfileLockMixin(_MixinBase):
             return
 
         if not self._is_interactive_session():
-            # Deliberate: a headless session cannot ask the artist.
-            #   Refusing here would break farm jobs and automated
-            #   publishes, which open workfiles routinely. The open
-            #   continues, and '_after_workfile_open' does not acquire a
-            #   lock, so the interactive owner keeps theirs.
+            # A headless session cannot ask, and refusing would break
+            #   farm jobs that open workfiles routinely. It opens without
+            #   taking the lock, so the owner keeps it.
             log.warning(
                 "Workfile '%s' is locked by %s on %s, but there is no"
                 " GUI to ask about it. Continuing without a lock.",
@@ -361,7 +517,7 @@ class WorkfileLockMixin(_MixinBase):
             )
             return
 
-        if not self.confirm_locked_workfile(filepath):
+        if not self.confirm_locked_workfile(filepath, lock_data):
             raise WorkfileLockedError(filepath, lock_data)
 
     def _after_workfile_open(
@@ -370,6 +526,11 @@ class WorkfileLockMixin(_MixinBase):
         super()._after_workfile_open(open_workfile_context)
 
         if not self._is_interactive_session():
+            return
+
+        if self._lock_dialog_failed:
+            # Nobody was asked, so nobody agreed to take the lock over.
+            self._lock_dialog_failed = False
             return
 
         self.acquire_workfile_lock(
@@ -383,39 +544,63 @@ class WorkfileLockMixin(_MixinBase):
     ) -> None:
         super()._after_workfile_save(save_workfile_context)
 
+        # Checked before releasing anything, so a session that is not going
+        #   to re-acquire does not drop the lock it already holds.
+        if not self._is_interactive_session():
+            return
+
         dst_path = save_workfile_context.dst_path
+        project_name = save_workfile_context.project_name
+        project_settings = save_workfile_context.project_settings
+
         previous_path = self._locked_workfile_path
         if previous_path and previous_path != dst_path:
             # Save-as or version-up. Locks key on the exact path, so the
             #   lock has to follow the workfile.
             self.release_workfile_lock(previous_path)
 
-        if not self._is_interactive_session():
+        # Save-as can land on a path somebody else is working in, and no
+        #   dialog was shown for it, unlike the open path, where taking
+        #   a lock over is a decision the artist already made.
+        lock_data = self.get_workfile_lock_holder(
+            dst_path,
+            project_name=project_name,
+            project_settings=project_settings,
+        )
+        if lock_data is not None and not self.confirm_locked_workfile(
+            dst_path, lock_data
+        ):
+            log.warning(
+                "Workfile '%s' stays locked by %s on %s.",
+                dst_path,
+                lock_data.get("username"),
+                lock_data.get("hostname"),
+            )
             return
 
         self.acquire_workfile_lock(
             dst_path,
-            project_name=save_workfile_context.project_name,
-            project_settings=save_workfile_context.project_settings,
+            project_name=project_name,
+            project_settings=project_settings,
         )
 
     # --- Helpers ---
     def _is_interactive_session(self) -> bool:
         """Whether an artist is sitting in front of this session.
 
-        A running Qt application is used as the signal. It answers both
-        questions locking depends on: whether the lock dialog can be shown
-        at all, and whether this is the kind of session that has an exit
-        signal wired to release the lock. A headless session has neither,
-        so locking is skipped entirely rather than leaving a stale lock
-        nothing will ever clean up.
-
-        Can be overridden by a host that knows better.
+        ``workfile_lock_interactive`` answers this outright when a host
+        sets it. Otherwise a running Qt application is taken as the
+        signal, which is only a guess, because a farm job with an
+        offscreen Qt application looks the same. Hosts that can end up in
+        that state have to set the attribute, or override this.
 
         Returns:
-            bool: A Qt application instance exists.
+            bool: An artist can be asked about a lock.
 
         """
+        if self.workfile_lock_interactive is not None:
+            return bool(self.workfile_lock_interactive)
+
         try:
             from qtpy import QtWidgets
 
@@ -429,8 +614,8 @@ def _warn_on_shadowed_hooks(cls: type) -> None:
 
     Placing the mixin after ``IWorkfileHost`` in the base classes makes
     the interface defaults win the method resolution order and locking
-    silently does nothing. An override on the host itself is fine - the
-    docstring asks those to call ``super()``.
+    silently does nothing. A host overriding a hook itself is fine,
+    because the class docstring tells it to call ``super()``.
 
     Args:
         cls (type): Class being created.
@@ -456,3 +641,36 @@ def _warn_on_shadowed_hooks(cls: type) -> None:
             winner.__name__,
             cls.__name__,
         )
+
+
+def _warn_on_missing_release(cls: type) -> None:
+    """Warn when a host adopted the mixin without wiring release.
+
+    Core cannot see the host's exit signal, so the host has to say that it
+    wired one. Until it does, no lock is acquired at all. The
+    alternative is locks that outlive every session and make workfiles
+    look permanently taken.
+
+    Args:
+        cls (type): Class being created.
+
+    """
+    if cls.workfile_lock_release_wired:
+        return
+
+    # Intermediate base classes are not hosts yet, so they have nothing to
+    #   wire. Only a class that is actually a host is missing something.
+    if not any(
+        method_name in vars(klass)
+        for klass in cls.__mro__
+        for method_name in ("install", "get_current_workfile")
+    ):
+        return
+
+    log.warning(
+        "Host class '%s' uses 'WorkfileLockMixin' but does not set"
+        " 'workfile_lock_release_wired'. Workfile locking stays off."
+        " Call 'release_workfile_lock()' from the exit signal of the"
+        " host and set the attribute to True.",
+        cls.__name__,
+    )

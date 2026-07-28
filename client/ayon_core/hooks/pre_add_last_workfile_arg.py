@@ -1,6 +1,6 @@
-import os
-
 from ayon_applications import PreLaunchHook, LaunchTypes
+
+from ayon_core.pipeline.workfile import resolve_launch_workfile_path
 
 
 class AddLastWorkfileToLaunchArgs(PreLaunchHook):
@@ -39,19 +39,11 @@ class AddLastWorkfileToLaunchArgs(PreLaunchHook):
     launch_types = {LaunchTypes.local}
 
     def execute(self):
-        workfile_path = self.data.get("workfile_path")
+        # Shared with 'CheckWorkfileLock' (order 9), which decides from the
+        #   same two keys whether this hook gets to see a workfile at all.
+        workfile_path = resolve_launch_workfile_path(self.data)
         if not workfile_path:
-            if not self.data.get("start_last_workfile"):
-                self.log.info("It is set to not start last workfile on start.")
-                return
-
-            workfile_path = self.data.get("last_workfile_path")
-            if not workfile_path:
-                self.log.warning("Last workfile was not collected.")
-                return
-
-        if not os.path.exists(workfile_path):
-            self.log.info("Current context does not have any workfile yet.")
+            self.log.info("No workfile to open on launch.")
             return
 
         # Add path to workfile to arguments
