@@ -30,6 +30,21 @@ from .utils import (
     find_workfile_rootless_path,
 )
 
+from .lock_workfile import (
+    is_workfile_locked,
+    is_workfile_locked_for_current_process,
+    is_workfile_lock_enabled,
+    get_workfile_lock_data,
+    create_workfile_lock,
+    remove_workfile_lock,
+    delete_workfile_lock,
+)
+
+from .workfile_lock_mixin import (
+    WorkfileLockMixin,
+    WorkfileLockedError,
+)
+
 from .build_workfile import BuildWorkfile
 
 
@@ -70,6 +85,17 @@ __all__ = (
     "save_workfile_with_current_context",
     "save_next_version",
     "copy_workfile_to_context",
+
+    "is_workfile_locked",
+    "is_workfile_locked_for_current_process",
+    "is_workfile_lock_enabled",
+    "get_workfile_lock_data",
+    "create_workfile_lock",
+    "remove_workfile_lock",
+    "delete_workfile_lock",
+
+    "WorkfileLockMixin",
+    "WorkfileLockedError",
 
     "BuildWorkfile",
 

@@ -3,7 +3,22 @@ import json
 from ayon_core.lib import Logger, filter_profiles
 from ayon_core.lib.ayon_info import get_workstation_info
 from ayon_core.settings import get_project_settings
-from ayon_core.pipeline import get_process_id
+
+
+def _get_process_id():
+    """Process id of the current session.
+
+    Imported on demand. This module is imported while
+    'ayon_core.pipeline' is still initializing, so 'get_process_id' cannot
+    be imported at module level.
+
+    Returns:
+        str: Process id.
+
+    """
+    from ayon_core.pipeline import get_process_id
+
+    return get_process_id()
 
 
 def _read_lock_file(lock_filepath):
@@ -37,7 +52,7 @@ def is_workfile_locked_for_current_process(filepath):
 
     lock_filepath = _get_lock_file(filepath)
     data = _read_lock_file(lock_filepath)
-    return data["process_id"] == get_process_id()
+    return data["process_id"] == _get_process_id()
 
 
 def delete_workfile_lock(filepath):
@@ -49,7 +64,7 @@ def delete_workfile_lock(filepath):
 def create_workfile_lock(filepath):
     lock_filepath = _get_lock_file(filepath)
     info = get_workstation_info()
-    info["process_id"] = get_process_id()
+    info["process_id"] = _get_process_id()
     with open(lock_filepath, "w") as stream:
         json.dump(info, stream)
 
@@ -68,7 +83,9 @@ def is_workfile_lock_enabled(host_name, project_name, project_setting=None):
         ["tools"]
         ["Workfiles"]
         ["workfile_lock_profiles"])
-    profile = filter_profiles(workfile_lock_profiles, {"host_name": host_name})
+    profile = filter_profiles(
+        workfile_lock_profiles, {"host_names": host_name}
+    )
     if not profile:
         return False
     return profile["enabled"]
