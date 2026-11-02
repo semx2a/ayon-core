@@ -1074,7 +1074,7 @@ PixmapButton:disabled {
 }
 
 #ListViewProductName[state="invalid"] {
-    color: {color:publisher:error};
+    color: {color:publisher:error-text};
 }
 
 #ListViewProductName[state="disabled"] {
